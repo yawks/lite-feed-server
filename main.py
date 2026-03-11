@@ -80,7 +80,7 @@ class EventUpdate(SQLModel):
     status: StatusEnum
 
 # Setup DB (SQLite)
-sqlite_file_name = "events.db"
+sqlite_file_name = os.getenv("DB_PATH", "events.db")
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url)
 
