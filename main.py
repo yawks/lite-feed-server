@@ -10,17 +10,14 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-# Charger les variables d'environnement
 load_dotenv()
 
-# --- Configuration & Modèles ---
+# --- Configuration & Models ---
 
-# Récupérer l'API key depuis les variables d'environnement
 API_KEY = os.getenv("API_KEY","xx")
 if not API_KEY:
     raise ValueError("API_KEY must be set in environment variables")
 
-# Dépendance pour valider l'API key
 def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     decoded_x_api_key = ""
     try:
@@ -34,18 +31,22 @@ def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: dict[WebSocket, dict] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, type: Optional[str], exclude_type: List[str]):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[websocket] = {"type": type, "exclude_type": exclude_type}
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        self.active_connections.pop(websocket, None)
 
     async def broadcast(self, message: dict):
-        # Envoie le message à tous les clients connectés
-        for connection in self.active_connections:
+        event_type = message.get("type")
+        for connection, filters in self.active_connections.items():
+            if filters["type"] and event_type != filters["type"]:
+                continue
+            if filters["exclude_type"] and event_type in filters["exclude_type"]:
+                continue
             await connection.send_json(message)
 
 manager = ConnectionManager()
@@ -54,7 +55,7 @@ class StatusEnum(str, Enum):
     READ = "READ"
     UNREAD = "UNREAD"
 
-# Le modèle de base de données
+# database model
 class Event(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
     title: str
@@ -66,7 +67,7 @@ class Event(SQLModel, table=True):
     pub_date: datetime = Field(default_factory=datetime.now)
 
 
-# Modèle pour la création (l'utilisateur n'envoie pas l'ID ni la date)
+# model  for creation (the user does not send the ID nor the date)
 class EventCreate(SQLModel):
     title: str
     description: Optional[str] = None
@@ -74,7 +75,7 @@ class EventCreate(SQLModel):
     image_url: Optional[str] = None
     type: Optional[str] = None
 
-# Modèle pour la mise à jour
+# model for update (only status can be updated)
 class EventUpdate(SQLModel):
     status: StatusEnum
 
@@ -118,11 +119,10 @@ async def add_event(event_data: EventCreate, _: str = Depends(verify_api_key)):
         session.commit()
         session.refresh(event)
 
-        # --- PARTIE WEBSOCKET ---
-        # On convertit l'objet en JSON compatible (gère la date str automatiquement)
+        # --- WEBSOCKET PART ---
+        # convert object to dict and format date as string
         event_json = jsonable_encoder(event)
 
-        # On diffuse à tout le monde
         await manager.broadcast(event_json)
 
         return event
@@ -142,10 +142,10 @@ async def add_event(event_data: EventCreate, _: str = Depends(verify_api_key)):
     tags=["Événements"],
 )
 def get_events(
-    status: Annotated[Optional[StatusEnum], Query(description="Filtrer par status (`READ` ou `UNREAD`)")] = None,
-    type: Annotated[Optional[str], Query(description="Inclure uniquement ce type d'événement")] = None,
-    exclude_type: Annotated[List[str], Query(description="Exclure un ou plusieurs types (répéter le paramètre pour plusieurs valeurs)")] = [],
-    max: Annotated[int, Query(ge=1, le=500, description="Nombre maximum d'événements retournés")] = 50,
+    status: Annotated[Optional[StatusEnum], Query(description="Filter by status (`READ` or `UNREAD`)")] = None,
+    type: Annotated[Optional[str], Query(description="Only include this type of event")] = None,
+    exclude_type: Annotated[List[str], Query(description="Exclude one or more types (repeat the parameter for multiple values)")] = [],
+    max: Annotated[int, Query(ge=1, le=500, description="Maximum number of events to return")] = 50,
     _: Annotated[str, Depends(verify_api_key)] = None,
 ):
     purge_old_events()
@@ -175,17 +175,20 @@ def get_events(
         return formatted_results
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, x_api_key: str = Query(...)):
-    # Vérifier l'API key avant d'accepter la connexion
+async def websocket_endpoint(
+    websocket: WebSocket,
+    x_api_key: str = Query(...),
+    type: Optional[str] = Query(default=None),
+    exclude_type: List[str] = Query(default=[]),
+):
     if x_api_key != API_KEY:
         await websocket.close(code=1008, reason="Invalid API Key")
         return
 
-    await manager.connect(websocket)
+    await manager.connect(websocket, type, exclude_type)
     try:
         while True:
-            # On maintient la connexion ouverte.
-            # Ici on attend juste, mais on pourrait recevoir des messages du client si besoin.
+            # keep the connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -203,5 +206,4 @@ def update_event(event_id: uuid.UUID, update_data: EventUpdate, _: str = Depends
         session.commit()
         session.refresh(event)
 
-        # Retour formaté (optionnel ici si on veut strict JSON, sinon Pydantic gère)
         return event
