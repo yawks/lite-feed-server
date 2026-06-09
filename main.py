@@ -1,8 +1,10 @@
 from base64 import b64decode
 from contextlib import asynccontextmanager
+import json
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.encoders import jsonable_encoder
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlalchemy import Column, JSON as SAJson
 from datetime import datetime, timedelta
 from typing import Annotated, List, Optional
 from enum import Enum
@@ -14,9 +16,12 @@ load_dotenv()
 
 # --- Configuration & Models ---
 
-API_KEY = os.getenv("API_KEY","xx")
+API_KEY = os.getenv("API_KEY", "xx")
 if not API_KEY:
     raise ValueError("API_KEY must be set in environment variables")
+
+VALID_ACTIONS = {"answer", "hangup", "mute", "unmute"}
+
 
 def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     decoded_x_api_key = ""
@@ -28,6 +33,16 @@ def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     if x_api_key != API_KEY and decoded_x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return x_api_key
+
+
+def verify_ws_api_key(x_api_key: str) -> bool:
+    decoded = ""
+    try:
+        decoded = b64decode(x_api_key).decode()
+    except Exception:
+        pass
+    return x_api_key == API_KEY or decoded == API_KEY
+
 
 class ConnectionManager:
     def __init__(self):
@@ -49,43 +64,73 @@ class ConnectionManager:
                 continue
             await connection.send_json(message)
 
+
+class CallManager:
+    def __init__(self):
+        self.calls: dict[str, WebSocket] = {}
+
+    def register(self, session_id: str, websocket: WebSocket):
+        self.calls[session_id] = websocket
+
+    def unregister(self, session_id: str):
+        self.calls.pop(session_id, None)
+
+    async def send_action(self, session_id: str, action: str) -> bool:
+        ws = self.calls.get(session_id)
+        if not ws:
+            return False
+        await ws.send_json({"action": action})
+        return True
+
+
 manager = ConnectionManager()
+call_manager = CallManager()
+
 
 class StatusEnum(str, Enum):
     READ = "READ"
     UNREAD = "UNREAD"
+
 
 # database model
 class Event(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, index=True)
     title: str
     description: Optional[str] = None
-    image: Optional[str] = None # Base64 string
+    image: Optional[str] = None  # Base64 string
     image_url: Optional[str] = None
     type: Optional[str] = None
     status: StatusEnum = Field(default=StatusEnum.UNREAD)
     pub_date: datetime = Field(default_factory=datetime.now)
+    session_id: Optional[str] = None
+    actions: Optional[List[str]] = Field(default=None, sa_column=Column(SAJson))
 
 
-# model  for creation (the user does not send the ID nor the date)
+# model for creation (the user does not send the ID nor the date)
 class EventCreate(SQLModel):
     title: str
     description: Optional[str] = None
     image: Annotated[Optional[str], Field(default=None, description="Image encodée en base64 (ex: `data:image/png;base64,iVBORw0KGgo...`)")]
     image_url: Optional[str] = None
     type: Optional[str] = None
+    session_id: Optional[str] = None
+    actions: Optional[List[str]] = None
+
 
 # model for update (only status can be updated)
 class EventUpdate(SQLModel):
     status: StatusEnum
+
 
 # Setup DB (SQLite)
 sqlite_file_name = os.getenv("DB_PATH", "events.db")
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url)
 
+
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
+
 
 # --- Application ---
 
@@ -97,11 +142,13 @@ def purge_old_events():
             session.delete(event)
         session.commit()
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     purge_old_events()
     yield
+
 
 app = FastAPI(
     title="Event Tracker Light",
@@ -109,6 +156,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
 
 # 1. Endpoint: add-event
 @app.post("/add-event", response_model=Event)
@@ -119,13 +167,11 @@ async def add_event(event_data: EventCreate, _: str = Depends(verify_api_key)):
         session.commit()
         session.refresh(event)
 
-        # --- WEBSOCKET PART ---
-        # convert object to dict and format date as string
         event_json = jsonable_encoder(event)
-
         await manager.broadcast(event_json)
 
         return event
+
 
 # 2. Endpoint: get-events
 @app.get(
@@ -174,24 +220,6 @@ def get_events(
 
         return formatted_results
 
-@app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    x_api_key: str = Query(...),
-    type: Optional[str] = Query(default=None),
-    exclude_type: List[str] = Query(default=[]),
-):
-    if x_api_key != API_KEY:
-        await websocket.close(code=1008, reason="Invalid API Key")
-        return
-
-    await manager.connect(websocket, type, exclude_type)
-    try:
-        while True:
-            # keep the connection alive
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
 
 # 3. Endpoint: update-event
 @app.patch("/update-event/{event_id}", response_model=Event)
@@ -207,3 +235,58 @@ def update_event(event_id: uuid.UUID, update_data: EventUpdate, _: str = Depends
         session.refresh(event)
 
         return event
+
+
+# 4. WebSocket: desktop notifications feed
+@app.websocket("/ws")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    x_api_key: str = Query(...),
+    type: Optional[str] = Query(default=None),
+    exclude_type: List[str] = Query(default=[]),
+):
+    if not verify_ws_api_key(x_api_key):
+        await websocket.close(code=1008, reason="Invalid API Key")
+        return
+
+    await manager.connect(websocket, type, exclude_type)
+    try:
+        while True:
+            text = await websocket.receive_text()
+            try:
+                data = json.loads(text)
+                action = data.get("action")
+                session_id = data.get("session_id")
+                if action in VALID_ACTIONS and session_id:
+                    await call_manager.send_action(session_id, action)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+# 5. WebSocket: phone call signaling
+@app.websocket("/ws/calls")
+async def websocket_calls(
+    websocket: WebSocket,
+    x_api_key: str = Query(...),
+):
+    if not verify_ws_api_key(x_api_key):
+        await websocket.close(code=1008, reason="Invalid API Key")
+        return
+
+    await websocket.accept()
+    session_id: Optional[str] = None
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type == "ringing" and (session_id := data.get("session_id")):
+                call_manager.register(session_id, websocket)
+            elif msg_type == "ended" and session_id:
+                call_manager.unregister(session_id)
+                await manager.broadcast({"type": "ended", "session_id": session_id})
+                session_id = None
+    except WebSocketDisconnect:
+        if session_id:
+            call_manager.unregister(session_id)
