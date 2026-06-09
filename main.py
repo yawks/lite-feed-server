@@ -4,7 +4,7 @@ import json
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Header, Depends
 from fastapi.encoders import jsonable_encoder
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from sqlalchemy import Column, JSON as SAJson
+from sqlalchemy import Column, JSON as SAJson, text
 from datetime import datetime, timedelta
 from typing import Annotated, List, Optional
 from enum import Enum
@@ -132,6 +132,19 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 
+def migrate_db():
+    migrations = [
+        ("session_id", "ALTER TABLE event ADD COLUMN session_id VARCHAR"),
+        ("actions",    "ALTER TABLE event ADD COLUMN actions JSON"),
+    ]
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(event)"))}
+        for column, statement in migrations:
+            if column not in existing:
+                conn.execute(text(statement))
+        conn.commit()
+
+
 # --- Application ---
 
 def purge_old_events():
@@ -146,6 +159,7 @@ def purge_old_events():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
+    migrate_db()
     purge_old_events()
     yield
 
